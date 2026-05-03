@@ -1,4 +1,5 @@
 services:
+  name: swiftdeploy-app 
   image: swift-deploy-1-node:latest
   port: 3000
   mode: stable

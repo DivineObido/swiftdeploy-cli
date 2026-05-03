@@ -1,0 +1,64 @@
+services:
+  ${SERVICE_NAME}:
+    image: ${SERVICE_IMAGE}
+    container_name: ${SERVICE_NAME}
+ 
+    environment:
+      - MODE=${MODE}
+      - APP_VERSION=${APP_VERSION}
+      - APP_PORT=${SERVICE_PORT}
+
+    expose:
+      - "${SERVICE_PORT}"
+ 
+    networks:
+      - ${NETWORK_NAME}
+ 
+    restart: ${RESTART_POLICY}
+ 
+    # Named volume for logs
+    volumes:
+      - app_logs:${LOG_PATH}
+ 
+    # Health check hits /healthz inside the container
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:${SERVICE_PORT}/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+ 
+    # Security — drop all Linux capabilities
+    cap_drop:
+      - ALL
+ 
+  nginx:
+    image: ${NGINX_IMAGE}
+    container_name: swiftdeploy-nginx
+ 
+    ports:
+      # Only Nginx port is exposed to the host
+      - "${NGINX_PORT}:${NGINX_PORT}"
+ 
+    volumes:
+      # Mount the generated nginx.conf into the container
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - nginx_logs:/var/log/nginx
+ 
+    networks:
+      - ${NETWORK_NAME}
+ 
+    restart: ${RESTART_POLICY}
+ 
+    depends_on:
+      ${SERVICE_NAME}:
+        condition: service_healthy
+ 
+
+volumes:
+  app_logs:
+  nginx_logs:
+ 
+networks:
+  ${NETWORK_NAME}:
+    driver: ${NETWORK_DRIVER}
