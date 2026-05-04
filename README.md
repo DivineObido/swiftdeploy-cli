@@ -6,7 +6,6 @@ SwiftDeploy is a declarative deployment CLI tool that automatically builds and m
 manifest.yaml → swiftdeploy → nginx.conf + docker-compose.yml → running app
 You write `manifest.yaml` once. The CLI reads it and generates all the config files needed to run your app behind an Nginx reverse proxy inside Docker containers.
 
----
 
 ## Prerequisites
 
