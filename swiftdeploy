@@ -125,7 +125,7 @@ def cmd_init():
     log("Init complete.")
 
 
-# ── validate ──────────────────────────────────────────────────────────────────
+#  validate 
 def cmd_validate():
     """
     Run 5 pre-flight checks before deploying.
@@ -134,7 +134,7 @@ def cmd_validate():
     log("Running pre-flight validation checks...\n")
     passed = True
 
-    # ── Check 1: manifest.yaml exists and is valid YAML ──────────────────────
+    # Check if manifest.yaml exists and is valid YAML 
     print("Check 1: manifest.yaml exists and is valid YAML")
     try:
         if not os.path.exists(MANIFEST_PATH):
@@ -149,7 +149,7 @@ def cmd_validate():
         passed = False
         manifest = None
 
-    # ── Check 2: All required fields are present and non-empty ───────────────
+    # Check if all required fields are present and non-empty 
     print("\nCheck 2: All required fields present and non-empty")
     required_fields = [
         ("services.image",       lambda m: m["services"]["image"]),
@@ -175,10 +175,10 @@ def cmd_validate():
         if all_fields_ok:
             success("All required fields present")
     else:
-        fail("Skipping field check — manifest could not be loaded")
+        fail("Skipping field check, manifest could not be loaded")
         passed = False
 
-    # ── Check 3: Docker image exists locally ─────────────────────────────────
+    # Check if Docker image exists locally 
     print("\nCheck 3: Docker image exists locally")
     if manifest:
         image = manifest["services"]["image"]
@@ -192,7 +192,7 @@ def cmd_validate():
             fail(f"Image '{image}' not found locally. Run: docker build -t {image} ./app")
             passed = False
 
-    # ── Check 4: Nginx port is not already bound on the host ─────────────────
+    # Check if Nginx port is not already bound on the host 
     print("\nCheck 4: Nginx port is not already bound on the host")
     if manifest:
         nginx_port = int(manifest["nginx"]["port"])
@@ -206,7 +206,7 @@ def cmd_validate():
         else:
             success(f"Port {nginx_port} is free")
 
-    # ── Check 5: nginx.conf is syntactically valid ────────────────────────────
+    # Check if nginx.conf syntax is valid
     print("\nCheck 5: nginx.conf syntax is valid")
     if not os.path.exists(NGINX_OUT):
         fail("nginx.conf not found. Run: ./swiftdeploy init first")
@@ -241,7 +241,7 @@ def cmd_validate():
                 fail(f"nginx.conf has syntax errors:\n{result.stderr}")
                 passed = False
 
-    # ── Final result ──────────────────────────────────────────────────────────
+    # Final result
     print()
     if passed:
         log("All checks passed. Ready to deploy.")
@@ -250,7 +250,7 @@ def cmd_validate():
         sys.exit(1)
 
 
-# ── deploy ────────────────────────────────────────────────────────────────────
+# deploy
 def cmd_deploy():
     """
     1. Run init to generate config files
@@ -296,7 +296,7 @@ def cmd_deploy():
     sys.exit(1)
 
 
-# ── promote ───────────────────────────────────────────────────────────────────
+# promote 
 def cmd_promote(mode):
     """
     Switch between stable and canary mode.
@@ -348,7 +348,7 @@ def cmd_promote(mode):
         sys.exit(1)
 
 
-# ── teardown ──────────────────────────────────────────────────────────────────
+# teardown 
 def cmd_teardown(clean=False):
     """
     Stop and remove all containers, networks, and volumes.
@@ -373,9 +373,7 @@ def cmd_teardown(clean=False):
     log("Teardown complete.")
 
 
-# =============================================================================
-# ENTRYPOINT
-# =============================================================================
+# Usage info
 
 def print_usage():
     print("""
