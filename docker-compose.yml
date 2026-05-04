@@ -1,28 +1,28 @@
 services:
-  ${SERVICE_NAME}:
-    image: ${SERVICE_IMAGE}
-    container_name: ${SERVICE_NAME}
+  swiftdeploy-app:
+    image: swift-deploy-1-node:latest
+    container_name: swiftdeploy-app
  
     environment:
-      - MODE=${MODE}
-      - APP_VERSION=${APP_VERSION}
-      - APP_PORT=${SERVICE_PORT}
+      - MODE=stable
+      - APP_VERSION=1.0
+      - APP_PORT=3000
 
     expose:
-      - "${SERVICE_PORT}"
+      - "3000"
  
     networks:
-      - ${NETWORK_NAME}
+      - swiftdeploy-net
  
-    restart: ${RESTART_POLICY}
+    restart: unless-stopped
  
     # Named volume for logs
     volumes:
-      - app_logs:${LOG_PATH}
+      - app_logs:/var/log/app
  
     # Health check hits /healthz inside the container
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:${SERVICE_PORT}/healthz || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/healthz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -33,12 +33,12 @@ services:
       - ALL
  
   nginx:
-    image: ${NGINX_IMAGE}
+    image: nginx:latest
     container_name: swiftdeploy-nginx
  
     ports:
       # Only Nginx port is exposed to the host
-      - "${NGINX_PORT}:${NGINX_PORT}"
+      - "8080:8080"
  
     volumes:
       # Mount the generated nginx.conf into the container
@@ -46,12 +46,12 @@ services:
       - nginx_logs:/var/log/nginx
  
     networks:
-      - ${NETWORK_NAME}
+      - swiftdeploy-net
  
-    restart: ${RESTART_POLICY}
+    restart: unless-stopped
  
     depends_on:
-      ${SERVICE_NAME}:
+      swiftdeploy-app:
         condition: service_healthy
  
 
@@ -60,5 +60,5 @@ volumes:
   nginx_logs:
  
 networks:
-  ${NETWORK_NAME}:
-    driver: ${NETWORK_DRIVER}
+  swiftdeploy-net:
+    driver: bridge

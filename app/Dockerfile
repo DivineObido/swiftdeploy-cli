@@ -2,6 +2,8 @@ FROM python:3.11-alpine
 
 WORKDIR /app
 
+RUN apk add --no-cache wget
+
 RUN addgroup -S appgroup && \
     adduser -S -G appgroup appuser
 
