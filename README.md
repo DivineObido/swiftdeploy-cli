@@ -1,4 +1,4 @@
-# SwiftDeploy
+# SwiftDeploy CLI
 
 SwiftDeploy is a declarative deployment CLI tool that automatically builds and manages your entire application stack from a single `manifest.yaml` file. Instead of manually writing config files, you define what you want in the manifest and the CLI handles everything else.
 
