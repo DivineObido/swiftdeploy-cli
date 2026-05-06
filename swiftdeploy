@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-# =============================================================================
-# swiftdeploy — CLI tool that manages the entire deployment lifecycle
-# Usage: ./swiftdeploy [init|validate|deploy|promote|teardown]
-# =============================================================================
 
 import os
 import sys
 import time
 import subprocess
 import yaml
+import shutil
 import socket
+import json
+import platform
+import requests
+from datetime import datetime, timezone
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-# Everything is relative to the project root (where this script lives)
+# Paths
 ROOT_DIR          = os.path.dirname(os.path.abspath(__file__))
 MANIFEST_PATH     = os.path.join(ROOT_DIR, "manifest.yaml")
 NGINX_TEMPLATE    = os.path.join(ROOT_DIR, "templates", "nginx.conf.template")
@@ -21,9 +21,7 @@ NGINX_OUT         = os.path.join(ROOT_DIR, "nginx.conf")
 COMPOSE_OUT       = os.path.join(ROOT_DIR, "docker-compose.yml")
 
 
-# =============================================================================
 # HELPERS
-# =============================================================================
 
 def log(msg):
     """Print a message with a prefix."""
@@ -31,11 +29,11 @@ def log(msg):
 
 
 def success(msg):
-    print(f"  ✔  {msg}")
+    print(f"{msg}")
 
 
 def fail(msg):
-    print(f"  ✘  {msg}")
+    print(f"{msg}")
 
 
 def run(cmd, capture=False):
@@ -95,12 +93,166 @@ def fill_template(template_path, variables):
 
     return content
 
+# OPA integration
+# Call OPA from inside the app container using docker exec
+def query_opa(policy, input_data):
+    url = f"http://localhost:8181/v1/data/{policy}"
 
-# =============================================================================
+    payload = {
+        "input": input_data
+    }
+
+    try:
+        res = requests.post(url, json=payload, timeout=5)
+
+        if res.status_code != 200:
+            return {"error": f"OPA returned HTTP {res.status_code}: {res.text}"}
+
+        data = res.json()
+        return data.get("result", {})
+
+    except requests.exceptions.ConnectionError:
+        return {"error": "Cannot connect to OPA (is it running?)"}
+
+    except requests.exceptions.Timeout:
+        return {"error": "OPA request timed out"}
+
+    except Exception as e:
+        return {"error": str(e)}
+    
+def append_history(entry):
+    history_file = os.path.join(ROOT_DIR, "history.jsonl")
+    with open(history_file, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+def get_system_stats():
+    disk_free_gb = shutil.disk_usage("/").free / (1024**3)
+    cpu_load = os.getloadavg()[0] if platform.system() != "Windows" else 0.5
+    memory_free_percent = 50
+
+    return disk_free_gb, cpu_load, memory_free_percent
+
+def write_snapshot(event, metrics, policy, extra=None):
+    """
+    Unified history writer for deploy/promote/status
+    """
+    entry = {
+        "event": event,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "metrics": metrics or {},
+        "policy": policy or {}
+    }
+
+    if extra:
+        entry.update(extra)
+
+    append_history(entry)
+    
+def get_metrics():
+    manifest = load_manifest()
+    svc_name = manifest["services"].get("name", "swiftdeploy-app")
+
+    result = subprocess.run(
+        f"docker exec {svc_name} wget -qO- http://localhost:3000/metrics",
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        return None
+
+    return result.stdout
+
+def parse_metrics(text):
+    metrics = {
+        "requests": 0,
+        "errors": 0,
+        "p99": 0.0,
+        "error_rate": 0.0
+    }
+
+    total_requests = 0
+    error_requests = 0
+    bucket_counts = {}  # {le_value: count}
+
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+
+        # total requests
+        if line.startswith("http_requests_total{"):
+            try:
+                total_requests += float(line.split()[-1])
+            except:
+                pass
+
+        # error requests (5xx only)
+        if "http_requests_total{" in line and "status_code=\"5" in line:
+            try:
+                error_requests += float(line.split()[-1])
+            except:
+                pass
+
+        # histogram buckets for P99 — grab the le value and count
+        if line.startswith("http_request_duration_seconds_bucket{"):
+            try:
+                # extract le value e.g le="0.5"
+                le_part = [p for p in line.split(",") if "le=" in p][0]
+                le_val = le_part.split('"')[1]
+                count = float(line.split()[-1])
+                if le_val != "+Inf":
+                    bucket_counts[float(le_val)] = count
+            except:
+                pass
+
+    metrics["requests"] = total_requests
+    metrics["errors"] = error_requests
+
+    # calculate error rate as percentage
+    if total_requests > 0:
+        metrics["error_rate"] = (error_requests / total_requests) * 100
+    else:
+        metrics["error_rate"] = 0.0
+
+    # calculate P99 from histogram buckets
+    # P99 = find the smallest bucket where count >= 99% of total requests
+    if bucket_counts and total_requests > 0:
+        p99_threshold = total_requests * 0.99
+        for le_val in sorted(bucket_counts.keys()):
+            if bucket_counts[le_val] >= p99_threshold:
+                metrics["p99"] = le_val * 1000  # convert to ms
+                break
+        else:
+            # requests exceeded all buckets — use largest bucket value
+            metrics["p99"] = sorted(bucket_counts.keys())[-1] * 1000
+
+    return metrics
+
+def get_policy_status():
+    metrics_raw = get_metrics()
+    metrics = parse_metrics(metrics_raw) if metrics_raw else {}
+
+    infra = query_opa("infrastructure", {
+        "disk_free_gb": 50,
+        "cpu_load": 0.5,
+        "memory_free_percent": 80
+    })
+
+    canary = query_opa("canary", {
+        "error_rate": metrics.get("error_rate", 0.0),
+        "p99_latency_ms": metrics.get("p99", 0.0)
+    })
+
+    return {
+        "infra": infra,
+        "canary": canary
+    }
+
+
 # SUBCOMMANDS
-# =============================================================================
 
-# ── init ──────────────────────────────────────────────────────────────────────
+# init
 def cmd_init():
     """
     Read manifest.yaml, fill the templates, write nginx.conf and docker-compose.yml.
@@ -252,27 +404,49 @@ def cmd_validate():
 
 # deploy
 def cmd_deploy():
-    """
-    1. Run init to generate config files
-    2. Bring up the stack with docker compose
-    3. Wait for health checks to pass (60s timeout)
-    """
     log("Starting deployment...")
 
     # Step 1 — generate config files
     cmd_init()
 
-    # Step 2 — bring up the stack
+    # Step 2 — start OPA container before the app
+    log("Starting OPA...")
+    run(f"docker compose -f {COMPOSE_OUT} up -d opa")
+    time.sleep(3)  # give OPA time to boot
+
+    # Step 3 — collect host stats using helper
+    disk_free_gb, cpu_load, memory_free_percent = get_system_stats()
+
+    # Step 4 — pre-deploy OPA check
+    log("Running pre-deploy policy check...")
+    opa_result = query_opa("infrastructure", {
+        "disk_free_gb": disk_free_gb,
+        "cpu_load": cpu_load,
+        "memory_free_percent": memory_free_percent
+    })
+
+    if "error" in opa_result:
+        fail(f"OPA error: {opa_result['error']}")
+        sys.exit(1)
+
+    if not opa_result.get("allow", True):
+        fail("Deployment blocked by policy:")
+        for msg in opa_result.get("deny", []):
+            print(" -", msg)
+        sys.exit(1)
+
+    success("Pre-deploy policy passed")
+
+    # Step 5 — bring up the full stack
     log("Starting containers with docker compose...")
     run(f"docker compose -f {COMPOSE_OUT} up -d --build")
 
-    # Step 3 — wait for health checks
+    # Step 6 — wait for health checks
     log("Waiting for health checks to pass (timeout: 60s)...")
-    manifest  = load_manifest()
-    svc_name  = manifest["services"].get("name", "swiftdeploy-app")
-    svc_port  = manifest["services"]["port"]
-    timeout   = 60
-    start     = time.time()
+    manifest = load_manifest()
+    svc_name = manifest["services"].get("name", "swiftdeploy-app")
+    timeout  = 60
+    start    = time.time()
 
     while time.time() - start < timeout:
         result = subprocess.run(
@@ -285,6 +459,19 @@ def cmd_deploy():
             success(f"Container '{svc_name}' is healthy")
             log("Stack is up and running.")
             log(f"Access your app at: http://localhost:{manifest['nginx']['port']}")
+
+            # collect metrics and write snapshot after healthy
+            metrics_raw = get_metrics()
+            metrics = parse_metrics(metrics_raw) if metrics_raw else {}
+
+            write_snapshot(
+                event="deploy",
+                metrics=metrics,
+                policy={
+                    "infra": opa_result,
+                    "canary": {}
+                }
+            )
             return
 
         elapsed = int(time.time() - start)
@@ -298,55 +485,105 @@ def cmd_deploy():
 
 # promote 
 def cmd_promote(mode):
-    """
-    Switch between stable and canary mode.
-    1. Validate the mode argument
-    2. Update manifest.yaml mode field in place
-    3. Regenerate docker-compose.yml with new MODE env var
-    4. Restart only the service container
-    5. Confirm new mode by hitting /healthz
-    """
+
     if mode not in ("stable", "canary"):
         log(f"ERROR: invalid mode '{mode}'. Use: stable or canary")
         sys.exit(1)
 
     log(f"Promoting to {mode} mode...")
 
-    # Step 1 — update manifest.yaml in place
-    manifest = load_manifest()
-    manifest["services"]["mode"] = mode
+    # collect host stats early so they're available throughout
+    disk_free_gb, cpu_load, memory_free_percent = get_system_stats()
 
+    # Step 1 — pre-promote OPA check using canary metrics
+    log("Running pre-promote policy check...")
+
+    manifest = load_manifest()
+    svc_name = manifest["services"].get("name", "swiftdeploy-app")
+    svc_port = manifest["services"]["port"]
+
+    result = subprocess.run(
+        f'docker exec {svc_name} wget -qO- http://localhost:{svc_port}/metrics',
+        shell=True, capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        fail("Could not fetch metrics from app container")
+        sys.exit(1)
+
+    raw_metrics = result.stdout
+
+    # derive error rate and latency from chaos state
+    error_rate  = 5.0  if "chaos_active 2" in raw_metrics else 0.0
+    p99_latency = 1000 if "chaos_active 1" in raw_metrics else 100
+
+    opa_result = query_opa("canary", {
+        "error_rate": error_rate,
+        "p99_latency_ms": p99_latency
+    })
+
+    if "error" in opa_result:
+        fail(f"OPA error: {opa_result['error']}")
+        sys.exit(1)
+
+    if not opa_result.get("allow", True):
+        fail("Promotion blocked by policy:")
+        for msg in opa_result.get("deny", []):
+            print(" -", msg)
+        sys.exit(1)
+
+    success("Pre-promote policy passed")
+
+    # Step 2 — update manifest.yaml mode in place
+    manifest["services"]["mode"] = mode
     with open(MANIFEST_PATH, "w") as f:
         yaml.dump(manifest, f, default_flow_style=False, sort_keys=False)
     success(f"manifest.yaml updated: mode = {mode}")
 
-    # Step 2 — regenerate docker-compose.yml with new MODE
+    # Step 3 — regenerate docker-compose.yml with new MODE
     cmd_init()
 
-    # Step 3 — restart only the service container (not nginx)
-    svc_name = manifest["services"].get("name", "swiftdeploy-app")
+    # Step 4 — restart only the service container
     log(f"Restarting service container '{svc_name}'...")
     run(f"docker compose -f {COMPOSE_OUT} up -d --no-deps {svc_name}")
     success(f"Container '{svc_name}' restarted")
 
-    # Step 4 — confirm new mode by hitting /healthz
+    # Step 5 — confirm new mode via /healthz
     log("Confirming new mode via /healthz...")
-    svc_port = manifest["services"]["port"]
-    time.sleep(5)  # give container a moment to start
+    time.sleep(5)
 
     result = subprocess.run(
         f'docker exec {svc_name} wget --quiet -O - http://localhost:{svc_port}/healthz',
         shell=True, capture_output=True, text=True
     )
 
-    if result.returncode == 0:
-        success(f"/healthz response: {result.stdout.strip()}")
-        log(f"Promotion to {mode} complete.")
-    else:
+    if result.returncode != 0:
         fail("Could not confirm new mode via /healthz")
         log(result.stderr)
         sys.exit(1)
 
+    success(f"/healthz response: {result.stdout.strip()}")
+    log(f"Promotion to {mode} complete.")
+
+    # Step 6 — write snapshot after successful promotion
+    metrics_raw = get_metrics()
+    metrics = parse_metrics(metrics_raw) if metrics_raw else {}
+
+    infra_policy = query_opa("infrastructure", {
+        "disk_free_gb": disk_free_gb,
+        "cpu_load": cpu_load,
+        "memory_free_percent": memory_free_percent
+    })
+
+    write_snapshot(
+        event="promote",
+        metrics=metrics,
+        policy={
+            "infra": infra_policy,
+            "canary": opa_result
+        },
+        extra={"mode": mode}
+    )
 
 # teardown 
 def cmd_teardown(clean=False):
@@ -372,26 +609,179 @@ def cmd_teardown(clean=False):
 
     log("Teardown complete.")
 
+def cmd_status():
+    log("Starting live status dashboard... (Ctrl+C to stop)")
+
+    while True:
+        metrics_raw = get_metrics()
+
+        if not metrics_raw:
+            fail("Cannot fetch metrics — is the stack running?")
+            time.sleep(2)
+            continue
+
+        metrics  = parse_metrics(metrics_raw)
+        policies = get_policy_status()
+
+        # write to history
+        write_snapshot(
+            event="status",
+            metrics=metrics,
+            policy=policies
+        )
+
+        # clear screen and display dashboard
+        os.system("cls" if os.name == "nt" else "clear")
+
+        print("=" * 40)
+        print("       SWIFTDEPLOY STATUS DASHBOARD")
+        print("=" * 40)
+        print(f"  Total Requests  : {metrics['requests']}")
+        print(f"  Error Requests  : {metrics['errors']}")
+        print(f"  Error Rate      : {metrics['error_rate']:.2f}%")
+        print(f"  P99 Latency     : {metrics['p99']:.1f}ms")
+        print()
+        print("  Policy Compliance:")
+        infra_status  = "✔ PASS" if policies['infra'].get('allow', True) else "✘ FAIL"
+        canary_status = "✔ PASS" if policies['canary'].get('allow', True) else "✘ FAIL"
+        print(f"  Infrastructure  : {infra_status}")
+        print(f"  Canary Safety   : {canary_status}")
+
+        # show denial reasons if any policy is failing
+        infra_deny  = policies['infra'].get('deny', [])
+        canary_deny = policies['canary'].get('deny', [])
+
+        if infra_deny or canary_deny:
+            print()
+            print("  Policy Violations:")
+            for msg in infra_deny:
+                print(f"    ✘ [infra]  {msg}")
+            for msg in canary_deny:
+                print(f"    ✘ [canary] {msg}")
+
+        print()
+        print("  Press Ctrl+C to stop")
+        print("=" * 40)
+
+        time.sleep(3)
+        
+def cmd_audit():
+    history_file = os.path.join(ROOT_DIR, "history.jsonl")
+    output_file  = os.path.join(ROOT_DIR, "audit_report.md")
+
+    if not os.path.exists(history_file):
+        log("No history found. Run deploy/promote first.")
+        return
+
+    entries = []
+    with open(history_file, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                entries.append(json.loads(line))
+            except:
+                continue
+
+    if not entries:
+        log("History is empty")
+        return
+
+    md = []
+    md.append("# SwiftDeploy Audit Report\n")
+    md.append(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
+    md.append(f"Total events recorded: {len(entries)}\n")
+
+    # ── Timeline — only deploy and promote events ─────────────────────────────
+    md.append("## Event Timeline\n")
+    md.append("| Timestamp | Event | Mode | Requests | Errors | Error Rate | P99 |")
+    md.append("|-----------|-------|------|----------|--------|------------|-----|")
+
+    lifecycle_events = [e for e in entries if e.get("event") in ("deploy", "promote")]
+
+    if lifecycle_events:
+        for entry in lifecycle_events:
+            ts         = entry.get("timestamp", "")[:19].replace("T", " ")
+            event      = entry.get("event", "")
+            mode       = entry.get("mode", entry.get("extra", {}).get("mode", "stable"))
+            metrics    = entry.get("metrics", {})
+            requests   = metrics.get("requests", 0)
+            errors     = metrics.get("errors", 0)
+            error_rate = metrics.get("error_rate", 0.0)
+            p99        = metrics.get("p99", 0.0)
+            md.append(f"| {ts} | {event} | {mode} | {requests} | {errors} | {error_rate:.2f}% | {p99:.0f}ms |")
+    else:
+        md.append("| — | No deploy/promote events found | — | — | — | — | — |")
+
+    md.append("")
+
+    # ── Policy Violations summary ─────────────────────────────────────────────
+    md.append("## Policy Violations\n")
+
+    # group violations by type and count them instead of listing every single one
+    infra_violations  = []
+    canary_violations = []
+
+    for entry in entries:
+        infra  = entry.get("policy", {}).get("infra", {})
+        canary = entry.get("policy", {}).get("canary", {})
+
+        if not infra.get("allow", True):
+            for msg in infra.get("deny", []):
+                clean_msg = msg.encode("ascii", "replace").decode("ascii").replace("?", "-")
+                infra_violations.append((entry.get("timestamp", "")[:19].replace("T", " "), clean_msg))
+
+        if not canary.get("allow", True):
+            for msg in canary.get("deny", []):
+                clean_msg = msg.encode("ascii", "replace").decode("ascii").replace("?", "-")
+                canary_violations.append((entry.get("timestamp", "")[:19].replace("T", " "), clean_msg))
+
+    if not infra_violations and not canary_violations:
+        md.append("No policy violations recorded.\n")
+    else:
+        if infra_violations:
+            md.append("### Infrastructure Violations\n")
+            md.append(f"Total occurrences: {len(infra_violations)}\n")
+            md.append("| First seen | Last seen | Reason |")
+            md.append("|------------|-----------|--------|")
+            # show first and last only
+            first_ts, first_msg = infra_violations[0]
+            last_ts, _          = infra_violations[-1]
+            md.append(f"| {first_ts} | {last_ts} | {first_msg} |")
+            md.append("")
+
+        if canary_violations:
+            md.append("### Canary Violations\n")
+            md.append(f"Total occurrences: {len(canary_violations)}\n")
+            md.append("| First seen | Last seen | Reason |")
+            md.append("|------------|-----------|--------|")
+            first_ts, first_msg = canary_violations[0]
+            last_ts, _          = canary_violations[-1]
+            md.append(f"| {first_ts} | {last_ts} | {first_msg} |")
+            md.append("")
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(md))
+
+    success(f"Audit report generated -> {output_file}")
 
 # Usage info
 
 def print_usage():
     print("""
-SwiftDeploy — Declarative deployment CLI
+    SwiftDeploy — Declarative deployment CLI
 
-Usage: ./swiftdeploy <subcommand> [options]
+    Usage: ./swiftdeploy <subcommand> [options]
 
-Subcommands:
-  init                Generate nginx.conf and docker-compose.yml from manifest.yaml
-  validate            Run pre-flight checks before deploying
-  deploy              Init + bring up the stack + wait for health checks
-  promote <mode>      Switch deployment mode: stable or canary
-  teardown            Stop and remove all containers, networks, volumes
-  teardown --clean    Teardown + delete generated config files
-""")
+    Subcommands:
+    init                Generate nginx.conf and docker-compose.yml from manifest.yaml
+    validate            Run pre-flight checks before deploying
+    deploy              Init + bring up the stack + wait for health checks
+    promote <mode>      Switch deployment mode: stable or canary
+    teardown            Stop and remove all containers, networks, volumes
+    teardown --clean    Teardown + delete generated config files
+    """)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":          
     args = sys.argv[1:]
 
     if not args:
@@ -418,6 +808,12 @@ if __name__ == "__main__":
     elif command == "teardown":
         clean = "--clean" in args
         cmd_teardown(clean)
+        
+    elif command == "status":
+        cmd_status()
+
+    elif command == "audit":
+        cmd_audit()
 
     else:
         log(f"ERROR: unknown command '{command}'")

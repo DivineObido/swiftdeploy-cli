@@ -4,7 +4,7 @@ services:
     container_name: swiftdeploy-app
  
     environment:
-      - MODE=stable
+      - MODE=canary
       - APP_VERSION=1.0
       - APP_PORT=3000
 
@@ -53,6 +53,24 @@ services:
     depends_on:
       swiftdeploy-app:
         condition: service_healthy
+
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: swiftdeploy-opa
+    ports:
+      - "8181:8181"
+    
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "--set=decision_logs.console=true"
+      - "/policies"
+    volumes:
+      - ./policies:/policies
+    networks:
+      - swiftdeploy-net
+    restart: unless-stopped
  
 
 volumes:

@@ -53,6 +53,24 @@ services:
     depends_on:
       ${SERVICE_NAME}:
         condition: service_healthy
+
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: swiftdeploy-opa
+    ports:
+      - "8181:8181"
+    
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "--set=decision_logs.console=true"
+      - "/policies"
+    volumes:
+      - ./policies:/policies
+    networks:
+      - ${NETWORK_NAME}
+    restart: unless-stopped
  
 
 volumes:
