@@ -195,8 +195,3 @@ docker logs swiftdeploy-nginx
 - All Linux capabilities are dropped
 - The app port is never exposed directly to the host — all traffic goes through Nginx
 - Nginx config is mounted as read-only
-
-
-## Nginx Access Logs
-
-Every request through Nginx is logged in this format:
