@@ -2,6 +2,10 @@
 
 SwiftDeploy is a declarative deployment CLI tool that automatically builds and manages your entire application stack from a single `manifest.yaml` file. Instead of manually writing config files, you define what you want in the manifest and the CLI handles everything else.
 
+## Archictecture
+<img width="904" height="559" alt="Screenshot 2026-05-07 025419" src="https://github.com/user-attachments/assets/7c5ca2f5-6687-4955-ad9b-bc3864d5e770" />
+
+
 ## How It Works
 manifest.yaml → swiftdeploy → nginx.conf + docker-compose.yml → running app
 You write `manifest.yaml` once. The CLI reads it and generates all the config files needed to run your app behind an Nginx reverse proxy inside Docker containers.
@@ -127,6 +131,24 @@ What happens under the hood:
 
 <img width="955" height="703" alt="Screenshot 2026-05-04 002939" src="https://github.com/user-attachments/assets/ea4733f3-f580-491a-a00a-fd528ee9fa52" />
 
+### `status`
+
+Opens a live-refreshing terminal dashboard that scrapes `/metrics` every 3 seconds. Shows real-time request rate, error rate, P99 latency, and the current pass/fail status of every OPA policy. Every scrape is written to `history.jsonl` for the audit trail.
+
+```bash
+./swiftdeploy status
+```
+<img width="841" height="392" alt="Screenshot 2026-05-07 030047" src="https://github.com/user-attachments/assets/83bd56aa-1e8c-4056-911b-2e0480d886d6" />
+
+
+### `audit`
+
+Reads `history.jsonl` and generates `audit_report.md` — a clean GitHub Flavored Markdown report with a timeline of every lifecycle event and a summary of every policy violation.
+
+```bash
+./swiftdeploy audit
+```
+<img width="1292" height="616" alt="Screenshot 2026-05-07 025953" src="https://github.com/user-attachments/assets/f83b4c46-3ce6-45f0-a1ec-2b808d8c9904" />
 
 ### `teardown`
 Stops and removes all containers, networks, and volumes.
@@ -138,6 +160,23 @@ python swiftdeploy teardown
 # Stop everything and delete generated config files
 python swiftdeploy teardown --clean
 ```
+
+## OPA Policy Enforcement
+
+SwiftDeploy uses Open Policy Agent to enforce deployment safety rules. The CLI never makes allow or deny decisions itself — all logic lives in OPA.
+
+### Infrastructure Policy
+Checked before every deploy. Blocks deployment if:
+- Disk free space is below 10GB
+- CPU load is above 2.0
+- Memory free is below 10%
+
+### Canary Safety Policy
+Checked before every promotion. Blocks promotion if:
+- Error rate exceeds 1%
+- P99 latency exceeds 500ms
+
+Threshold values live in JSON data files inside the `policies/` directory. Changing a threshold never requires touching the policy logic.
 
 ## Nginx Access Logs
 Every request through Nginx is logged in this format:
